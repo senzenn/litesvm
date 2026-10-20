@@ -5,7 +5,7 @@ use {
     solana_keypair::Keypair,
     solana_message::Message,
     solana_nonce::{
-        state::{Data, State as NonceState},
+        state::{Data, DurableNonce, State as NonceState},
         versions::Versions,
     },
     solana_rent::Rent,
@@ -50,6 +50,56 @@ fn test_invalid_blockhash() {
     let tx_res = svm.send_transaction(tx);
 
     assert_eq!(tx_res.unwrap_err().err, TransactionError::BlockhashNotFound);
+}
+
+#[test_log::test]
+fn test_failed_nonce_transaction_advances_nonce() {
+    let payer_keypair = Keypair::new();
+    let payer = payer_keypair.pubkey();
+    let to = Address::new_unique();
+    let nonce_kp = Keypair::new();
+
+    let mut svm = LiteSVM::new();
+
+    svm.airdrop(&payer, 1_000_000_000).unwrap();
+    svm.airdrop(&to, 1_000_000_000).unwrap();
+    let create_nonce_ixns = solana_system_interface::instruction::create_nonce_account(
+        &payer,
+        &nonce_kp.pubkey(),
+        &payer,
+        1_500_000,
+    );
+    let tx = Transaction::new(
+        &[&payer_keypair, &nonce_kp],
+        Message::new_with_blockhash(&create_nonce_ixns, Some(&payer), &svm.latest_blockhash()),
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).unwrap();
+    let nonce = data_from_account(&svm.get_account(&nonce_kp.pubkey()).unwrap()).blockhash();
+    svm.expire_blockhash();
+
+    let nonce_tx = |lamports| {
+        let ixs = [
+            advance_nonce_account(&nonce_kp.pubkey(), &payer),
+            transfer(&payer, &to, lamports),
+        ];
+        let msg = Message::new_with_blockhash(&ixs, Some(&payer), &nonce);
+        Transaction::new(&[&payer_keypair], msg, nonce)
+    };
+    // The transfer fails because the payer does not have the lamports.
+    let err = svm
+        .send_transaction(nonce_tx(10_000_000_000))
+        .unwrap_err()
+        .err;
+    assert!(matches!(err, TransactionError::InstructionError(1, _)));
+    assert_eq!(
+        data_from_account(&svm.get_account(&nonce_kp.pubkey()).unwrap()).durable_nonce,
+        DurableNonce::from_blockhash(&svm.latest_blockhash())
+    );
+    assert_eq!(
+        svm.send_transaction(nonce_tx(1)).unwrap_err().err,
+        TransactionError::BlockhashNotFound
+    );
 }
 
 #[test_log::test]

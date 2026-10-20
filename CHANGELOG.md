@@ -5,6 +5,7 @@
 ### Fixed
 
 - Size accounts created by `litesvm-token::CreateAccount` for the extensions required by their Token-2022 mint.
+- Advance the nonce when a durable nonce transaction fails during execution. The nonce used to stay unchanged, so another transaction could use it again.
 
 ## [0.18.1] - 2026-10-19
 

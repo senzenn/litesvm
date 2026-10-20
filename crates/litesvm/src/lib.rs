@@ -343,7 +343,9 @@ use {
     agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
     agave_reserved_account_keys::ReservedAccountKeys,
     log::error,
-    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
+    solana_account::{
+        state_traits::StateMut, Account, AccountSharedData, ReadableAccount, WritableAccount,
+    },
     solana_address::Address,
     solana_builtins::BUILTINS,
     solana_clock::Clock,
@@ -361,7 +363,11 @@ use {
         inner_instruction::InnerInstructionsList, Message, SanitizedMessage, VersionedMessage,
     },
     solana_native_token::LAMPORTS_PER_SOL,
-    solana_nonce::{state::DurableNonce, NONCED_TX_MARKER_IX_INDEX},
+    solana_nonce::{
+        state::{Data as NonceData, DurableNonce, State as NonceState},
+        versions::Versions,
+        NONCED_TX_MARKER_IX_INDEX,
+    },
     solana_program_runtime::{
         invoke_context::{BuiltinFunctionRegisterer, EnvironmentConfig, InvokeContext},
         loaded_programs::{ProgramRuntimeEnvironment, ProgramRuntimeEnvironments},
@@ -1628,6 +1634,7 @@ impl LiteSVM {
                     .accounts
                     .withdraw(&payer, fee)
                     .and(exec_result.tx_result);
+                self.advance_nonce_of_failed_transaction(sanitized_tx);
             }
             exec_result
         } else {
@@ -1899,10 +1906,12 @@ impl LiteSVM {
     ) -> solana_transaction_error::TransactionResult<()> {
         let recent_blockhash = tx.message().recent_blockhash();
         if recent_blockhash == &self.latest_blockhash
-            || self.check_transaction_for_nonce(
-                tx,
-                &DurableNonce::from_blockhash(&self.latest_blockhash),
-            )
+            || self
+                .check_transaction_for_nonce(
+                    tx,
+                    &DurableNonce::from_blockhash(&self.latest_blockhash),
+                )
+                .is_some()
         {
             Ok(())
         } else {
@@ -1915,28 +1924,59 @@ impl LiteSVM {
         }
     }
 
-    fn check_message_for_nonce(&self, message: &SanitizedMessage) -> bool {
-        SVMMessage::get_durable_nonce(message)
-            .and_then(|nonce_address| self.accounts.get_account_ref(nonce_address))
+    fn check_message_for_nonce(&self, message: &SanitizedMessage) -> Option<(Address, NonceData)> {
+        let nonce_address = SVMMessage::get_durable_nonce(message)?;
+        self.accounts
+            .get_account_ref(nonce_address)
             .and_then(|nonce_account| {
                 solana_nonce_account::verify_nonce_account(
                     nonce_account,
                     message.recent_blockhash(),
                 )
             })
-            .is_some_and(|nonce_data| {
+            .filter(|nonce_data| {
                 SVMStaticMessage::get_ix_signers(message, NONCED_TX_MARKER_IX_INDEX as usize)
                     .any(|signer| signer == &nonce_data.authority)
             })
+            .map(|nonce_data| (*nonce_address, nonce_data))
     }
 
     fn check_transaction_for_nonce(
         &self,
         tx: &SanitizedTransaction,
         next_durable_nonce: &DurableNonce,
-    ) -> bool {
+    ) -> Option<(Address, NonceData)> {
         let nonce_is_advanceable = tx.message().recent_blockhash() != next_durable_nonce.as_hash();
-        nonce_is_advanceable && self.check_message_for_nonce(tx.message())
+        if !nonce_is_advanceable {
+            return None;
+        }
+        self.check_message_for_nonce(tx.message())
+    }
+
+    /// Agave advances the nonce of a failed durable nonce transaction:
+    /// https://github.com/anza-xyz/agave/blob/v4.3.2/svm/src/rollback_accounts.rs#L65-L100
+    fn advance_nonce_of_failed_transaction(&mut self, tx: &SanitizedTransaction) {
+        // A valid blockhash takes priority over a durable nonce.
+        if tx.message().recent_blockhash() == &self.latest_blockhash {
+            return;
+        }
+        let next_durable_nonce = DurableNonce::from_blockhash(&self.latest_blockhash);
+        let Some((nonce_address, nonce_data)) =
+            self.check_transaction_for_nonce(tx, &next_durable_nonce)
+        else {
+            return;
+        };
+        let Some(nonce_account) = self.accounts.inner.get_mut(&nonce_address) else {
+            return;
+        };
+        let state = NonceState::new_initialized(
+            &nonce_data.authority,
+            next_durable_nonce,
+            self.fee_structure.lamports_per_signature,
+        );
+        if let Err(err) = nonce_account.set_state(&Versions::new(state)) {
+            error!("Failed to advance nonce account {nonce_address}: {err}");
+        }
     }
 
     #[cfg(feature = "invocation-inspect-callback")]
